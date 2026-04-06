@@ -10,12 +10,9 @@ import 'package:admin_league/models/user_model.dart';
 import 'package:admin_league/screens/draft_category_screen.dart';
 import 'package:admin_league/screens/group_management_screen.dart';
 import 'package:admin_league/modals/team_constraints_modal.dart'; // Ajusta la ruta si es diferente
+import 'package:admin_league/modals/team_payment_modal.dart';
 import 'package:admin_league/screens/schedule_management_screen.dart';
 import 'package:admin_league/screens/player_identity_screen.dart';
-import 'package:admin_league/services/pdf_service.dart';
-import 'package:admin_league/models/player_model.dart';
-import 'dart:developer' as dev;
-import 'dart:convert';
 
 class TournamentDetailScreen extends StatefulWidget {
   final DashboardTournament tournament;
@@ -41,7 +38,10 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
 
   // Métricas calculadas en el cliente
   int _totalTeams = 0;
-  int _realTeams = 0; // Total menos equipos en estado crítico
+  int _paidTeamsCount = 0;
+  int _unpaidTeamsCount = 0;
+  /// Suma de equipos con pago en categorías que ya alcanzan [minTeams] pagados (viabilidad).
+  int _realTeams = 0;
 
   int _viewMode = 0; // 0 = Academias, 1 = Categorías
 
@@ -60,10 +60,26 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
 
   Map<String, dynamic> _schedulesMap = {}; // <--- CAMBIO
 
+  /// Monto sugerido al registrar pagos (dashboard + respuesta de equipos si trae `tournament.price`).
+  double? _paymentAmountDefault;
+
   @override
   void initState() {
     super.initState();
+    _paymentAmountDefault = widget.tournament.defaultPriceAmount;
     _loadTeams();
+  }
+
+  /// `mood == 0`: sin pago; el equipo no debe considerarse al completo.
+  static int _teamMoodValue(Map<String, dynamic> team) {
+    final m = team['mood'];
+    if (m == null) return 0;
+    if (m is int) return m;
+    return int.tryParse(m.toString()) ?? 0;
+  }
+
+  static bool _teamHasPaidRegistration(Map<String, dynamic> team) {
+    return _teamMoodValue(team) != 0;
   }
 
   Future<void> _loadTeams() async {
@@ -85,24 +101,43 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
         final academies = _groupByAcademy(allTeams);
         final categories = _groupByCategory(allTeams);
 
-        // Cálculo de métricas financieras/reales
-        int total = 0;
-        int real = 0;
-
-        for (var cat in categories) {
-          int count = cat['total'];
-          total += count;
-          // Si la categoría tiene 5 o más, cuenta para el real. Si tiene < 5 (Crítico), se descarta.
-          if (count >= 4) {
-            real += count;
+        int paid = 0;
+        for (var t in allTeams) {
+          if (_teamHasPaidRegistration(
+              Map<String, dynamic>.from(t as Map<dynamic, dynamic>))) {
+            paid++;
           }
         }
+
+        final int minTeams = widget.tournament.minTeams;
+        int real = 0;
+        for (var cat in categories) {
+          final int paidInCat = cat['paidCount'] as int? ?? 0;
+          if (paidInCat >= minTeams) {
+            real += paidInCat;
+          }
+        }
+
+        double? priceFromPayload;
+        final tourRaw = data['tournament'];
+        if (tourRaw is Map) {
+          priceFromPayload = DashboardTournament.defaultAmountFromPriceField(
+            tourRaw['price'],
+          );
+        }
+        priceFromPayload ??=
+            DashboardTournament.defaultAmountFromPriceField(data['price']);
 
         setState(() {
           _groupedAcademies = academies;
           _groupedCategories = categories;
-          _totalTeams = total;
+          _totalTeams = allTeams.length;
+          _paidTeamsCount = paid;
+          _unpaidTeamsCount = allTeams.length - paid;
           _realTeams = real;
+          if (priceFromPayload != null) {
+            _paymentAmountDefault = priceFromPayload;
+          }
           _isLoading = false;
         });
       }
@@ -119,15 +154,23 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
       if (!groups.containsKey(id)) {
         groups[id] = {
           'id': id,
-          'name': item['name'] ?? 'Sin Nombre', // item['academy']['name'] check was above
+          'name': item['academy']?['name'] ?? item['name'] ?? 'Sin Nombre',
           'logo': item['logo'],
           'total': 0,
+          'paidCount': 0,
+          'unpaidCount': 0,
           'items': [],
           'playerStats': {'approved': 0, 'partial': 0, 'rejected': 0, 'pending': 0},
         };
       }
-      
+
       groups[id]!['total'] += 1;
+      final mapItem = Map<String, dynamic>.from(item as Map<dynamic, dynamic>);
+      if (_teamHasPaidRegistration(mapItem)) {
+        groups[id]!['paidCount'] = (groups[id]!['paidCount'] as int) + 1;
+      } else {
+        groups[id]!['unpaidCount'] = (groups[id]!['unpaidCount'] as int) + 1;
+      }
       (groups[id]!['items'] as List).add(item);
 
       // Agregación de estadísticas de jugadores
@@ -150,13 +193,18 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
       String catName = item['category']['name'] ?? 'General';
       if (!groups.containsKey(catName)) {
         groups[catName] = {
-          'name': catName, 
-          'total': 0, 
+          'name': catName,
+          'total': 0,
+          'paidCount': 0,
           'items': [],
           'playerStats': {'approved': 0, 'partial': 0, 'rejected': 0, 'pending': 0}
         };
       }
       groups[catName]!['total'] += 1;
+      final mapItem = Map<String, dynamic>.from(item as Map<dynamic, dynamic>);
+      if (_teamHasPaidRegistration(mapItem)) {
+        groups[catName]!['paidCount'] = (groups[catName]!['paidCount'] as int) + 1;
+      }
       (groups[catName]!['items'] as List).add(item);
 
       // Agregación de estadísticas de jugadores
@@ -172,29 +220,60 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
     return groups.values.toList();
   }
 
-  // --- LÓGICA DE ESTADO ---
-  Map<String, dynamic> _calculateCategoryStatus(int total) {
-    if (total > 18) {
-      return {'color': _statusPurple, 'text': '3 GRUPOS', 'priority': 4};
-    } else if (total > 12) {
-      return {'color': _statusPurple, 'text': '2 GRUPOS', 'priority': 4};
-    } else if (total > 8) {
-      return {'color': _statusOptimal, 'text': 'ÓPTIMO', 'priority': 3};
-    } else if (total >= 6) {
-      return {'color': _statusViable, 'text': 'VIABLE', 'priority': 2};
-    } else if (total >= 4) {
-      // <--- CAMBIO: 4 y 5 ahora son "Mínimo Viable"
-      return {'color': _statusMin, 'text': 'MÍNIMO', 'priority': 1};
-    } else {
-      // Menos de 4
-      int missing =
-          5 - total; // <--- CAMBIO: Calculamos cuánto falta para llegar a 4
+  // --- LÓGICA DE ESTADO (categoría vs minTeams del torneo) ---
+  /// [totalCount] = equipos en la categoría; [paidCount] = con pago (mood ≠ 0).
+  /// Primero se cubre el cupo de **equipos inscritos**; luego el de **pagos** para salir a torneo.
+  Map<String, dynamic> _calculateCategoryStatusMinTeams(
+    int paidCount,
+    int totalCount,
+    int minTeams,
+  ) {
+    final int min = minTeams < 1 ? 4 : minTeams;
+
+    if (totalCount < min) {
+      final int missTeams = min - totalCount;
+      if (missTeams >= 2) {
+        return {
+          'color': _statusCritical,
+          'text': 'FALTAN $missTeams',
+          'priority': 0,
+        };
+      }
+      return {
+        'color': _statusMin,
+        'text': 'FALTA 1',
+        'priority': 1,
+      };
+    }
+
+    if (paidCount >= min) {
+      if (paidCount == min) {
+        return {
+          'color': _statusViable,
+          'text': 'LISTO',
+          'priority': 2,
+        };
+      }
+      return {
+        'color': _statusOptimal,
+        'text': 'SOBRE MÍNIMO',
+        'priority': 3,
+      };
+    }
+
+    final int missPay = min - paidCount;
+    if (missPay >= 2) {
       return {
         'color': _statusCritical,
-        'text': 'FALTAN $missing',
+        'text': 'FALTAN $missPay PAGO',
         'priority': 0,
       };
     }
+    return {
+      'color': _statusMin,
+      'text': 'FALTA 1 PAGO',
+      'priority': 1,
+    };
   }
 
   @override
@@ -290,16 +369,35 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
           ),
         ],
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
+      child: Column(
         children: [
-          // Total Bruto
-          _buildBigStat("TOTAL", "$_totalTeams", _textSecondary),
-
-          Container(width: 1, height: 40, color: _bgScaffold),
-
-          // Total Real (Efectivo)
-          _buildBigStat("REALES", "$_realTeams", _statusViable),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildBigStat("TOTAL", "$_totalTeams", _textSecondary),
+              Container(width: 1, height: 40, color: _bgScaffold),
+              _buildBigStat("CON PAGO", "$_paidTeamsCount", _statusViable),
+              Container(width: 1, height: 40, color: _bgScaffold),
+              _buildBigStat(
+                "SIN PAGO",
+                "$_unpaidTeamsCount",
+                _unpaidTeamsCount > 0 ? _statusCritical : _textSecondary,
+              ),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.only(top: 14),
+            child: Text(
+              "Cupos viables (categorías con al menos ${widget.tournament.minTeams} equipos con pago): $_realTeams",
+              textAlign: TextAlign.center,
+              style: GoogleFonts.inter(
+                fontSize: 10,
+                height: 1.3,
+                color: _textSecondary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -385,7 +483,7 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
 
   // --- LISTA 1: ACADEMIAS (Alfabético) ---
   // ===========================================================================
-  // LISTA 1: ACADEMIAS (CON BULK UPDATE Y BADGES)
+  // LISTA 1: ACADEMIAS (BADGES)
   // ===========================================================================
   Widget _buildAcademiesList() {
     if (_groupedAcademies.isEmpty) return _buildEmptySliver("Sin equipos");
@@ -441,75 +539,77 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
                 ),
 
                 // --- 2. NOMBRE DE LA ACADEMIA + RESUMEN (NUEVO) ---
-                title: Row(
+                title: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Expanded(
-                      child: Text(
-                        item['name'],
-                        style: GoogleFonts.inter(
-                          fontWeight: FontWeight.w600,
-                          fontSize: 15,
-                          color: _textPrimary,
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            item['name'],
+                            style: GoogleFonts.inter(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                              color: _textPrimary,
+                            ),
+                          ),
+                        ),
+                        if (item['playerStats'] != null)
+                          _buildSummaryStats(item['playerStats']),
+                      ],
+                    ),
+                    if ((item['total'] as int) > 0)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          '${item['paidCount']} con pago · ${item['unpaidCount']} sin pago',
+                          style: GoogleFonts.inter(
+                            fontSize: 10,
+                            color: _textSecondary,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
-                    ),
-                    if (item['playerStats'] != null)
-                      _buildSummaryStats(item['playerStats']),
                   ],
                 ),
 
-                // --- 3. ACCIONES Y CONTADOR (Trailing) ---
+                // --- 3. CONTADOR + PAGOS ACADEMIA (Trailing) ---
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                      IconButton(
-                        onPressed: () => _exportAcademyPdf(item),
-                        icon: const Icon(
-                          Icons.picture_as_pdf_outlined,
-                          size: 20,
-                          color: Colors.redAccent,
+                    if (widget.user.canAssignPayments)
+                      IconButton.filledTonal(
+                        onPressed: () => _showAcademyPaymentModal(item),
+                        style: IconButton.styleFrom(
+                          backgroundColor: const Color(0xFFE8F5E9),
+                          foregroundColor: const Color(0xFF2E7D32),
                         ),
-                        tooltip: "Exportar Reporte PDF (Academia)",
-                        constraints: const BoxConstraints(),
-                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.payments_rounded, size: 22),
+                        tooltip: 'Asignar pagos por academia',
                       ),
-                      const SizedBox(width: 12),
-
-                      // A. Botón de Acción Masiva (Bulk Update)
-                    // Visible para todos los roles administrativos que pueden gestionar equipos
-                      IconButton(
-                        icon: Icon(
-                          Icons.miscellaneous_services_outlined,
-                          size: 20,
-                          color: Colors.indigo[800],
+                    if (widget.user.canAssignPayments)
+                      const SizedBox(width: 4),
+                    Tooltip(
+                      message: 'Equipos con pago / total en la academia',
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 2,
                         ),
-                        tooltip: "Aplicar condiciones a toda la academia",
-                        constraints: const BoxConstraints(), // Compacto
-                        padding: EdgeInsets.zero,
-                        onPressed: () {
-                          // Llamamos a la función de edición masiva
-                          _showBulkConstraintsModal(item);
-                        },
-                      ),
-
-                    const SizedBox(width: 10),
-
-                    // B. Contador de Equipos
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: _bgScaffold,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        '${item['total']}',
-                        style: GoogleFonts.inter(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          color: _textPrimary,
+                        decoration: BoxDecoration(
+                          color: _bgScaffold,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          '${item['paidCount']}/${item['total']}',
+                          style: GoogleFonts.inter(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12,
+                            color: (item['unpaidCount'] as int) > 0
+                                ? _statusMin
+                                : _statusViable,
+                          ),
                         ),
                       ),
                     ),
@@ -523,128 +623,95 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
                     physics: const NeverScrollableScrollPhysics(),
                     itemCount: item['items'].length,
                     itemBuilder: (ctx, idx) {
-                      final team = item['items'][idx];
+                      final teamMap = Map<String, dynamic>.from(
+                        item['items'][idx] as Map,
+                      );
 
                       // Verificar si tiene condiciones especiales
                       final bool hasConstraints =
-                          team['constraints'] != null &&
-                          (team['constraints'] as Map).isNotEmpty;
+                          teamMap['constraints'] != null &&
+                          (teamMap['constraints'] as Map).isNotEmpty;
 
-                      return InkWell(
-                        onTap: () {
-                          // Editar individualmente
-                          _showConstraintsModal(team);
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            // Línea divisoria sutil entre equipos
-                            border: Border(top: BorderSide(color: _bgScaffold)),
-                          ),
-                          child: Row(
-                            children: [
-                              // A. Icono de Estado (Izquierda)
-                              if (hasConstraints)
-                                Padding(
-                                  padding: const EdgeInsets.only(right: 12),
-                                  child: Icon(
-                                    Icons
-                                        .info_outline, // Info azul en vez de warning
-                                    size: 18,
-                                    color: Colors.blue[800],
-                                  ),
-                                )
-                              else
-                                const SizedBox(
-                                  width: 30,
-                                ), // Espacio para alinear
-                              // B. Nombre + Badges (Centro)
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      team['name'],
-                                      style: GoogleFonts.inter(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w500,
-                                        color: _textPrimary,
-                                      ),
-                                    ),
-                                    // NUEVO: Renderizar Badges si existen
-                                    if (hasConstraints)
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 4),
-                                        child: _buildConstraintsBadges(
-                                          team['constraints'],
-                                        ),
-                                      ),
-                                  ],
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          border: Border(top: BorderSide(color: _bgScaffold)),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (hasConstraints)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 12),
+                                child: Icon(
+                                  Icons.info_outline,
+                                  size: 18,
+                                  color: Colors.blue[800],
                                 ),
-                              ),
-
-                               // C. Categoría + Icono Edit (Derecha)
-                              Row(
+                              )
+                            else
+                              const SizedBox(width: 30),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  if (team['playerStats'] != null)
-                                    Padding(
-                                      padding: const EdgeInsets.only(right: 8),
-                                      child: _buildPlayerStatsBadges(team['playerStats']),
-                                    ),
-                                   IconButton(
-                                    onPressed: () => _exportTeamPdf(team),
-                                    icon: const Icon(
-                                      Icons.picture_as_pdf_outlined,
-                                      size: 18,
-                                      color: Colors.redAccent,
-                                    ),
-                                    constraints: const BoxConstraints(),
-                                    padding: EdgeInsets.zero,
-                                    tooltip: "Reporte PDF",
-                                  ),
-                                  const SizedBox(width: 8),
-                                  IconButton(
-                                    icon: const Icon(
-                                      Icons.badge_outlined,
-                                      size: 18,
-                                      color: Colors.blueAccent,
-                                    ),
-                                    constraints: const BoxConstraints(),
-                                    padding: EdgeInsets.zero,
-                                    onPressed: () {
-                                      Navigator.push(
-                                        context,
-                                        MaterialPageRoute(
-                                          builder: (_) => PlayerIdentityScreen(
-                                            teamId: (team['id'] ?? team['_id']).toString(),
-                                            teamName: team['name'] ?? 'Sin Nombre',
-                                            user: widget.user,
+                                  Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          teamMap['name'],
+                                          style: GoogleFonts.inter(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w500,
+                                            color: _teamHasPaidRegistration(
+                                                    teamMap)
+                                                ? _textPrimary
+                                                : _textSecondary,
                                           ),
                                         ),
-                                      );
-                                    },
+                                      ),
+                                      const SizedBox(width: 6),
+                                      _buildTeamPaymentBadge(teamMap),
+                                      if (teamMap['playerStats'] != null)
+                                        Padding(
+                                          padding:
+                                              const EdgeInsets.only(left: 8),
+                                          child: _buildPlayerStatsBadges(
+                                            teamMap['playerStats'],
+                                          ),
+                                        ),
+                                    ],
                                   ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    team['category']?['name'] ?? '',
-                                    style: GoogleFonts.inter(
-                                      fontSize: 11,
-                                      color: _textSecondary,
+                                  if (hasConstraints)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4),
+                                      child: _buildConstraintsBadges(
+                                        teamMap['constraints'],
+                                      ),
                                     ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Icon(
-                                    Icons.edit_outlined,
-                                    size: 14,
-                                    color: Colors.grey[400],
-                                  ),
+                                  if ((teamMap['category']?['name'] ?? '')
+                                      .toString()
+                                      .isNotEmpty)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4),
+                                      child: Text(
+                                        teamMap['category']?['name'] ?? '',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 11,
+                                          color: _textSecondary,
+                                        ),
+                                      ),
+                                    ),
+                                  _buildTeamQuickActionsRow(teamMap),
                                 ],
                               ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -665,8 +732,15 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
     List<Map<String, dynamic>> processed = List.from(_groupedCategories);
 
     // 1. Calcular Status y 2. Ordenar (Tu lógica actual se mantiene igual)
+    final int minTeams = widget.tournament.minTeams;
     for (var cat in processed) {
-      cat['meta'] = _calculateCategoryStatus(cat['total']);
+      final int paidInCat = cat['paidCount'] as int? ?? 0;
+      final int totalInCat = cat['total'] as int? ?? 0;
+      cat['meta'] = _calculateCategoryStatusMinTeams(
+        paidInCat,
+        totalInCat,
+        minTeams,
+      );
     }
     processed.sort((a, b) {
       int pA = a['meta']['priority'];
@@ -820,15 +894,17 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
   }
 
   Widget _buildTeamRowForCategory(Map<String, dynamic> team) {
+    final teamMap = Map<String, dynamic>.from(team);
     bool hasConstraints =
-        team['constraints'] != null && (team['constraints'] as Map).isNotEmpty;
-    String academyName = team['academy']?['name'] ?? 'Sin Academia';
+        teamMap['constraints'] != null &&
+        (teamMap['constraints'] as Map).isNotEmpty;
+    String academyName = teamMap['academy']?['name'] ?? 'Sin Academia';
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // 1. Logo Pequeño
           Container(
             width: 28,
             height: 28,
@@ -836,108 +912,67 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
               shape: BoxShape.circle,
               color: Colors.grey[100],
               border: Border.all(color: Colors.grey[300]!),
-              image: team['logo'] != null
+              image: teamMap['logo'] != null
                   ? DecorationImage(
-                      image: NetworkImage(team['logo']),
+                      image: NetworkImage(teamMap['logo']),
                       fit: BoxFit.cover,
                     )
                   : null,
             ),
-            child: team['logo'] == null
+            child: teamMap['logo'] == null
                 ? const Icon(Icons.shield, size: 14, color: Colors.grey)
                 : null,
           ),
-
           const SizedBox(width: 10),
-
-          // 2. Nombre y Badges
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  team['name'],
-                  style: GoogleFonts.inter(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: _textPrimary,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        teamMap['name'],
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: _teamHasPaidRegistration(teamMap)
+                              ? _textPrimary
+                              : _textSecondary,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    _buildTeamPaymentBadge(teamMap),
+                    if (teamMap['playerStats'] != null)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 6),
+                        child: _buildPlayerStatsBadges(teamMap['playerStats']),
+                      ),
+                  ],
                 ),
-                // Aquí mostramos la academia o los badges si tiene condiciones
                 if (hasConstraints)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
                     child: _buildConstraintsBadges(
-                      team['constraints'],
-                    ), // ¡Reutilizamos tu helper!
+                      teamMap['constraints'],
+                    ),
                   )
                 else
-                  Text(
-                    academyName,
-                    style: GoogleFonts.inter(
-                      fontSize: 10,
-                      color: _textSecondary,
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      academyName,
+                      style: GoogleFonts.inter(
+                        fontSize: 10,
+                        color: _textSecondary,
+                      ),
                     ),
                   ),
               ],
             ),
-          ),
-
-          // --- NUEVO: ESTADÍSTICAS DE JUGADORES (Aprobados, Rechazados, Parciales) ---
-          if (team['playerStats'] != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: _buildPlayerStatsBadges(team['playerStats']),
-            ),
-
-           IconButton(
-            onPressed: () => _exportTeamPdf(team),
-            icon: const Icon(
-              Icons.picture_as_pdf_outlined,
-              size: 18,
-              color: Colors.redAccent,
-            ),
-            constraints: const BoxConstraints(),
-            padding: EdgeInsets.zero,
-            tooltip: "Reporte PDF",
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            icon: const Icon(
-              Icons.badge_outlined,
-              size: 18,
-              color: Colors.blueAccent,
-            ),
-            constraints: const BoxConstraints(),
-            padding: EdgeInsets.zero,
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => PlayerIdentityScreen(
-                    teamId: (team['id'] ?? team['_id']).toString(),
-                    teamName: team['name'] ?? 'Sin Nombre',
-                    user: widget.user,
-                  ),
-                ),
-              );
-            },
-          ),
-          const SizedBox(width: 8),
-          // 3. Botón rápido de edición (Opcional)
-          IconButton(
-            icon: Icon(
-              Icons.settings_outlined,
-              size: 16,
-              color: Colors.grey[400],
-            ),
-            constraints: const BoxConstraints(),
-            padding: EdgeInsets.zero,
-            onPressed: () => _showConstraintsModal(
-              team,
-            ), // Permite editar condiciones desde aquí mismo
           ),
         ],
       ),
@@ -948,6 +983,8 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
     final meta = cat['meta'];
     final Color color = meta['color'];
     final int count = cat['total'];
+    final int paidCount = cat['paidCount'] as int? ?? 0;
+    final int unpaidCount = count - paidCount;
     final String statusText = meta['text'];
     final String catName = cat['name'];
 
@@ -1051,6 +1088,19 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
                     child: _buildSummaryStats(cat['playerStats']),
                   ),
 
+                if (count > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '$paidCount con pago · $unpaidCount sin pago',
+                      style: GoogleFonts.inter(
+                        fontSize: 10,
+                        color: _textSecondary,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+
                 if (isPublished && !isSynced)
                   Text(
                     "Cambios sin publicar",
@@ -1096,6 +1146,154 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Tres acciones por equipo: configuración, roster e inscripción/pago.
+  Widget _buildTeamQuickActionsRow(
+    Map<String, dynamic> teamMap, {
+    bool compact = false,
+  }) {
+    final double iconSize = compact ? 16 : 18;
+    final double fontSize = compact ? 11 : 12;
+    final EdgeInsets pad = EdgeInsets.symmetric(
+      vertical: compact ? 8 : 10,
+      horizontal: compact ? 4 : 8,
+    );
+
+    void openRoster() {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PlayerIdentityScreen(
+            teamId: (teamMap['id'] ?? teamMap['_id']).toString(),
+            teamName: teamMap['name'] ?? 'Sin Nombre',
+            user: widget.user,
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: EdgeInsets.only(top: compact ? 8 : 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Tooltip(
+              message: 'Configuración de restricciones y preferencias',
+              child: OutlinedButton.icon(
+                onPressed: () => _showConstraintsModal(teamMap),
+                icon: Icon(Icons.tune_rounded, size: iconSize),
+                label: Text(
+                  compact ? 'Config' : 'Configuración',
+                  style: GoogleFonts.inter(
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                style: OutlinedButton.styleFrom(padding: pad),
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Tooltip(
+              message: 'Revisión de roster e identidad de jugadores',
+              child: OutlinedButton.icon(
+                onPressed: openRoster,
+                icon: Icon(Icons.groups_2_outlined, size: iconSize),
+                label: Text(
+                  'Roster',
+                  style: GoogleFonts.inter(
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                style: OutlinedButton.styleFrom(
+                  padding: pad,
+                  foregroundColor: const Color(0xFF1565C0),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Tooltip(
+              message: 'Registrar o quitar pago de inscripción',
+              child: widget.user.canAssignPayments
+                  ? FilledButton.icon(
+                      onPressed: () => _showTeamPaymentModal(teamMap),
+                      icon: Icon(Icons.payments_rounded, size: iconSize),
+                      label: Text(
+                        'Pago',
+                        style: GoogleFonts.inter(
+                          fontSize: fontSize,
+                          fontWeight: FontWeight.w800,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      style: FilledButton.styleFrom(
+                        padding: pad,
+                        backgroundColor: const Color(0xFF2E7D32),
+                        foregroundColor: Colors.white,
+                      ),
+                    )
+                  : OutlinedButton.icon(
+                      onPressed: null,
+                      icon: Icon(Icons.visibility_off_outlined,
+                          size: compact ? 14 : 16),
+                      label: Text(
+                        'Solo lectura',
+                        style: GoogleFonts.inter(
+                          fontSize: fontSize,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      style: OutlinedButton.styleFrom(padding: pad),
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTeamPaymentBadge(Map<String, dynamic> team) {
+    final paid = _teamHasPaidRegistration(team);
+    return Tooltip(
+      message: paid
+          ? 'Inscripción con pago registrado'
+          : 'Sin pago confirmado; el equipo no cuenta al completo para el torneo.',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: paid
+              ? _statusViable.withAlpha(28)
+              : _statusCritical.withAlpha(28),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(
+            color: paid
+                ? _statusViable.withAlpha(100)
+                : _statusCritical.withAlpha(100),
+            width: 0.5,
+          ),
+        ),
+        child: Text(
+          paid ? 'Con pago' : 'Sin pago',
+          style: GoogleFonts.inter(
+            fontSize: 9,
+            fontWeight: FontWeight.w800,
+            color: paid ? const Color(0xFF1B5E20) : const Color(0xFFB71C1C),
+          ),
+        ),
       ),
     );
   }
@@ -1525,6 +1723,373 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
     return {"groupsConfig": groupsConfig, "organizedTeams": groupsMap};
   }
 
+  void _throwIfAssignPaymentError(dynamic data) {
+    if (data is Map && data['status'] == 'error') {
+      throw Exception(data['message'] ?? 'Error del servidor');
+    }
+  }
+
+  String _teamIdOf(Map<String, dynamic> t) =>
+      (t['_id'] ?? t['id']).toString();
+
+  /// Aplica cambios de pago solo donde aplica y recalcula derivados
+  /// únicamente para las academias/categorías afectadas.
+  void _applyTeamPaymentUpdatesToStateFine(
+    List<Map<String, dynamic>> updatedTeams,
+  ) {
+    if (updatedTeams.isEmpty) return;
+
+    final minTeams = widget.tournament.minTeams;
+    final Map<String, Map<String, dynamic>> updatesById = {};
+    for (final ut in updatedTeams) {
+      final id = _teamIdOf(ut);
+      if (id.isNotEmpty) updatesById[id] = ut;
+    }
+    final updatedIds = updatesById.keys.toSet();
+    if (updatedIds.isEmpty) return;
+
+    // 1) Detectar qué academias/categorías se ven afectadas + snapshots previos
+    final Set<String> affectedAcademyIds = {};
+    final Map<String, int> oldAcademyPaid = {};
+
+    final Set<String> affectedCategoryNames = {};
+    final Map<String, int> oldCategoryContribution = {};
+
+    for (final academy in _groupedAcademies) {
+      final academyId = academy['id']?.toString() ?? '';
+      if (academyId.isEmpty) continue;
+
+      bool touches = false;
+      for (final t in (academy['items'] as List)) {
+        final tid = (t as Map)['_id'] ?? (t as Map)['id'];
+        if (tid != null && updatedIds.contains(tid.toString())) {
+          touches = true;
+          break;
+        }
+      }
+      if (touches) {
+        affectedAcademyIds.add(academyId);
+        oldAcademyPaid[academyId] = (academy['paidCount'] as int?) ?? 0;
+      }
+    }
+
+    for (final cat in _groupedCategories) {
+      final catName = cat['name']?.toString() ?? '';
+      if (catName.isEmpty) continue;
+
+      bool touches = false;
+      for (final t in (cat['items'] as List)) {
+        final tid = (t as Map)['_id'] ?? (t as Map)['id'];
+        if (tid != null && updatedIds.contains(tid.toString())) {
+          touches = true;
+          break;
+        }
+      }
+      if (touches) {
+        affectedCategoryNames.add(catName);
+        final paid = (cat['paidCount'] as int?) ?? 0;
+        oldCategoryContribution[catName] = paid >= minTeams ? paid : 0;
+      }
+    }
+
+    final int oldPaidTotal = oldAcademyPaid.values.fold(0, (a, b) => a + b);
+    final int oldContributionTotal =
+        oldCategoryContribution.values.fold(0, (a, b) => a + b);
+
+    // 2) Aplicar mood/paymentRegistration en memoria (equipos cambiados)
+    for (final academy in _groupedAcademies) {
+      for (final t in (academy['items'] as List)) {
+        final tid = (t as Map)['_id'] ?? (t as Map)['id'];
+        if (tid == null) continue;
+        final id = tid.toString();
+        final ut = updatesById[id];
+        if (ut == null) continue;
+
+        (t as Map)['mood'] = ut['mood'];
+        final pr = ut['paymentRegistration'];
+        if (pr != null) {
+          (t as Map)['paymentRegistration'] = pr;
+        }
+      }
+    }
+
+    // 3) Recalcular solo academias afectadas
+    int newPaidTotal = 0;
+    for (final academy in _groupedAcademies) {
+      final academyId = academy['id']?.toString() ?? '';
+      if (!affectedAcademyIds.contains(academyId)) continue;
+
+      int paid = 0;
+      int unpaid = 0;
+      for (final t in (academy['items'] as List)) {
+        final tMap = (t as Map).cast<String, dynamic>();
+        if (_teamMoodValue(tMap) != 0) {
+          paid++;
+        } else {
+          unpaid++;
+        }
+      }
+      academy['paidCount'] = paid;
+      academy['unpaidCount'] = unpaid;
+      newPaidTotal += paid;
+    }
+
+    _paidTeamsCount = _paidTeamsCount - oldPaidTotal + newPaidTotal;
+    _unpaidTeamsCount = _totalTeams - _paidTeamsCount;
+
+    // 4) Recalcular solo categorías afectadas
+    int newContributionTotal = 0;
+    for (final cat in _groupedCategories) {
+      final catName = cat['name']?.toString() ?? '';
+      if (!affectedCategoryNames.contains(catName)) continue;
+
+      final items = (cat['items'] as List);
+      final total = items.length;
+      int paid = 0;
+      for (final t in items) {
+        final tMap = (t as Map).cast<String, dynamic>();
+        if (_teamMoodValue(tMap) != 0) paid++;
+      }
+      final unpaid = total - paid;
+
+      cat['paidCount'] = paid;
+      cat['unpaidCount'] = unpaid;
+      cat['total'] = total;
+      cat['meta'] = _calculateCategoryStatusMinTeams(paid, total, minTeams);
+
+      if (paid >= minTeams) newContributionTotal += paid;
+    }
+
+    _realTeams = _realTeams - oldContributionTotal + newContributionTotal;
+  }
+
+  void _applyTeamPaymentUpdateToState(Map<String, dynamic> updatedTeam) {
+    final String id = _teamIdOf(updatedTeam);
+    final dynamic updatedMood = updatedTeam['mood'];
+    final dynamic updatedPaymentRegistration = updatedTeam['paymentRegistration'];
+
+    // Actualizamos en academias
+    for (final academy in _groupedAcademies) {
+      final items = (academy['items'] as List);
+      for (final t in items) {
+        final tId = (t as Map)['_id'] ?? (t as Map)['id'];
+        if (tId != null && tId.toString() == id) {
+          (t as Map)['mood'] = updatedMood;
+          if (updatedPaymentRegistration != null) {
+            (t as Map)['paymentRegistration'] = updatedPaymentRegistration;
+          }
+        }
+      }
+    }
+
+    // Actualizamos en categorías
+    for (final cat in _groupedCategories) {
+      final items = (cat['items'] as List);
+      for (final t in items) {
+        final tId = (t as Map)['_id'] ?? (t as Map)['id'];
+        if (tId != null && tId.toString() == id) {
+          (t as Map)['mood'] = updatedMood;
+          if (updatedPaymentRegistration != null) {
+            (t as Map)['paymentRegistration'] = updatedPaymentRegistration;
+          }
+        }
+      }
+    }
+  }
+
+  void _recalculatePaymentDerivedState() {
+    final int minTeams = widget.tournament.minTeams;
+
+    int paidTotal = 0;
+    for (final academy in _groupedAcademies) {
+      int paid = 0;
+      int unpaid = 0;
+      for (final t in (academy['items'] as List)) {
+        final tMap = Map<String, dynamic>.from(t as Map);
+        final moodVal = _teamMoodValue(tMap);
+        if (moodVal != 0) {
+          paid++;
+        } else {
+          unpaid++;
+        }
+      }
+      academy['paidCount'] = paid;
+      academy['unpaidCount'] = unpaid;
+      paidTotal += paid;
+    }
+
+    _paidTeamsCount = paidTotal;
+    _unpaidTeamsCount = _totalTeams - paidTotal;
+
+    int real = 0;
+    for (final cat in _groupedCategories) {
+      final items = (cat['items'] as List);
+      final int total = items.length;
+      int paid = 0;
+      for (final t in items) {
+        final tMap = Map<String, dynamic>.from(t as Map);
+        final moodVal = _teamMoodValue(tMap);
+        if (moodVal != 0) paid++;
+      }
+
+      cat['paidCount'] = paid;
+      cat['unpaidCount'] = total - paid;
+      cat['total'] = total;
+      cat['meta'] = _calculateCategoryStatusMinTeams(paid, total, minTeams);
+
+      if (paid >= minTeams) {
+        real += paid;
+      }
+    }
+
+    _realTeams = real;
+  }
+
+  Future<Map<String, dynamic>> _persistTeamMood(
+    Map<String, dynamic> team,
+    int mood, {
+    double? amount,
+  }) async {
+    final teamId = (team['_id'] ?? team['id']).toString();
+    final response = await _apiService.assignTeamPayment(
+      teamId: teamId,
+      mood: mood,
+      actingUserId: widget.user.id,
+      assignedByUserName: widget.user.userName,
+      amount: amount,
+    );
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      throw Exception('Error HTTP ${response.statusCode}');
+    }
+    _throwIfAssignPaymentError(response.data);
+
+    final teamOut = response.data is Map ? response.data['team'] : null;
+    if (teamOut is Map) return Map<String, dynamic>.from(teamOut);
+    throw Exception('Respuesta inválida del servidor (team)');
+  }
+
+  Future<List<Map<String, dynamic>>> _persistTeamsMoodBulk(
+    List<Map<String, dynamic>> teams,
+    int mood, {
+    double? amount,
+  }) async {
+    final updates = teams
+        .map(
+          (t) => <String, dynamic>{
+            'teamId': (t['_id'] ?? t['id']).toString(),
+            'mood': mood,
+          },
+        )
+        .toList();
+    final response = await _apiService.assignTeamPaymentsBulk(
+      updates: updates,
+      actingUserId: widget.user.id,
+      assignedByUserName: widget.user.userName,
+      amount: amount,
+      tournamentIdForSocket: widget.tournament.id,
+    );
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      throw Exception('Error HTTP ${response.statusCode}');
+    }
+    _throwIfAssignPaymentError(response.data);
+
+    final out = response.data is Map ? response.data['teams'] : null;
+    if (out is List) {
+      return out.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+    }
+    return <Map<String, dynamic>>[];
+  }
+
+  void _showTeamPaymentModal(Map<String, dynamic> team) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => TeamPaymentSheet(
+        team: team,
+        defaultAmount: _paymentAmountDefault,
+        onSave: (mood, amount) async {
+          try {
+            final updated = await _persistTeamMood(team, mood, amount: amount);
+            setState(() {
+              _applyTeamPaymentUpdatesToStateFine([updated]);
+            });
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Estado de pago actualizado'),
+                backgroundColor: Color(0xFF34C759),
+              ),
+            );
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('No se pudo guardar: $e'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+            rethrow;
+          }
+        },
+      ),
+    );
+  }
+
+  void _showAcademyPaymentModal(Map<String, dynamic> academyGroup) {
+    final raw = academyGroup['items'] as List? ?? [];
+    final teams = raw
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    if (teams.isEmpty) return;
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.sizeOf(context).height * 0.9,
+        child: AcademyPaymentSheet(
+          academyName: academyGroup['name']?.toString() ?? 'Academia',
+          teams: teams,
+          defaultAmount: _paymentAmountDefault,
+          onApply: (selected, mood, amount) async {
+            try {
+              final updatedTeams =
+                  await _persistTeamsMoodBulk(selected, mood, amount: amount);
+              setState(() {
+                _applyTeamPaymentUpdatesToStateFine(updatedTeams);
+              });
+              if (!mounted) return;
+              final n = selected.length;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    mood == kMoodPaid
+                        ? 'Pago registrado en $n equipo${n == 1 ? '' : 's'}'
+                        : 'Pago quitado en $n equipo${n == 1 ? '' : 's'}',
+                  ),
+                  backgroundColor: const Color(0xFF34C759),
+                ),
+              );
+            } catch (e) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('No se pudo guardar: $e'),
+                    backgroundColor: Colors.red,
+                  ),
+                );
+              }
+              rethrow;
+            }
+          },
+        ),
+      ),
+    );
+  }
+
   // --- MODAL DE RESTRICCIONES Y PREFERENCIAS ---
   void _showConstraintsModal(Map<String, dynamic> team) {
     // Definir total de jornadas (DashboardTournament no expone gameweeks; usar default)
@@ -1588,268 +2153,5 @@ class _TournamentDetailScreenState extends State<TournamentDetailScreen> {
         );
       },
     );
-  }
-
-  // ===========================================================================
-  // MODAL DE EDICIÓN MASIVA (BULK UPDATE)
-  // ===========================================================================
-  void _showBulkConstraintsModal(Map<String, dynamic> academyGroup) {
-    const int totalJornadas = 8;
-    List<dynamic> teamsInAcademy = academyGroup['items'];
-    String academyName = academyGroup['name'];
-
-    // PROTECCIÓN: Si por alguna razón la lista está vacía, no hacemos nada
-    if (teamsInAcademy.isEmpty) return;
-
-    // TRUCO: Tomamos el primer equipo real como "molde" para evitar nulos
-    var firstTeam = teamsInAcademy.first;
-
-    // Construimos un Dummy Team ROBUSTO
-    // Llenamos los campos que suelen causar crashes si faltan (id, category, academy)
-    Map<String, dynamic> dummyTeam = {
-      '_id': 'bulk_dummy_id', // Un ID falso para que no sea null
-      'id': 'bulk_dummy_id',
-      'name': "TODA LA ACADEMIA: $academyName",
-      'logo': academyGroup['logo'],
-
-      // Inicializamos constraints vacío para que el usuario configure desde cero
-      'constraints': {},
-
-      // Rellenamos datos estructurales para engañar al Modal y que no truene
-      'category': {'name': 'Múltiples Categorías', 'id': 'mixed'},
-      'academy':
-          firstTeam['academy'] ??
-          {'name': academyName, 'id': academyGroup['id']},
-      'gpo': 1,
-    };
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        return TeamConstraintsModal(
-          team: dummyTeam,
-          allTeams: _allTeamsRaw,
-          totalJornadas: totalJornadas,
-          currentUser: widget.user,
-
-          onSave: (payload) async {
-            Navigator.pop(context); // Cerrar modal
-
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text("Aplicando cambios masivos..."),
-                duration: Duration(seconds: 1),
-              ),
-            );
-
-            try {
-              List<Map<String, dynamic>> bulkItems = [];
-
-              setState(() {
-                for (var team in teamsInAcademy) {
-                  // 1. Actualización Visual
-                  team['constraints'] = payload;
-
-                  // 2. Preparación de envío (Objetos completos)
-                  bulkItems.add(team);
-                }
-              });
-
-              // 3. Envío al Backend
-              print(bulkItems);
-              // final response = await _apiService.editMultipleNlff(bulkItems);
-
-              // if (response.statusCode == 200 || response.statusCode == 201) {
-              //   if (!mounted) return;
-              //   ScaffoldMessenger.of(context).showSnackBar(
-              //     SnackBar(
-              //       content: Text("¡Éxito! ${bulkItems.length} equipos actualizados."),
-              //       backgroundColor: const Color(0xFF34C759),
-              //     ),
-              //   );
-              // } else {
-              //   throw Exception("Error del servidor: ${response.statusCode}");
-              // }
-            } catch (e) {
-              print("Error Bulk: $e");
-              if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text("Error: $e"),
-                  backgroundColor: Colors.red,
-                ),
-              );
-            }
-          },
-        );
-      },
-    );
-  }
-
-  // ===========================================================================
-  // EXPORTACIÓN PDF
-  // ===========================================================================
-
-  void _showLoadingDialog(String message) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        content: Row(
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(width: 20),
-            Expanded(child: Text(message)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _showErrorSnackBar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), backgroundColor: Colors.red),
-    );
-  }
-
-  Future<void> _exportAcademyPdf(Map<String, dynamic> academy) async {
-    _showLoadingDialog("Generando reporte de academia...");
-    try {
-      List<Map<String, dynamic>> reportData = [];
-      final List teams = List.from(academy['items'] ?? []);
-      
-      for (var team in teams) {
-        final teamId = (team['id'] ?? team['_id']).toString();
-        final resp = await _apiService.getPlayersByTeam(teamId);
-        if (resp.statusCode == 200) {
-          final dynamic rawData = resp.data;
-          final Map<String, dynamic> body = rawData is String 
-              ? Map<String, dynamic>.from(jsonDecode(rawData)) 
-              : Map<String, dynamic>.from(rawData is Map ? rawData : {});
-          
-          final dynamic rowsRaw = body['rows'];
-          final List rowsList = rowsRaw is Iterable ? List.from(rowsRaw) : [];
-          final List playersRaw = rowsList.map((r) => Map<String, dynamic>.from(r['doc'] ?? r)).toList();
-          
-          final List playersForReport = [];
-          for (var pJson in playersRaw) {
-            final p = Player.fromJson(pJson);
-            final v = p.identidadValidada;
-            
-            String statusText = 'PDTE';
-            String missing = '';
-            if (v != null) {
-              if (v.status == 3) statusText = 'APROBADO';
-              else if (v.status == 2) {
-                statusText = 'PARCIAL';
-                List<String> m = [];
-                if (!v.foto) m.add('FOTO');
-                if (!v.identificacion) m.add('ID');
-                missing = m.join(', ');
-              } else {
-                statusText = 'RECHAZADO';
-                missing = 'TODOS';
-              }
-            }
-
-            playersForReport.add({
-              'name': p.fullName,
-              'number': p.number ?? '-',
-              'statusText': statusText,
-              'missing': missing,
-              'notes': v?.notas ?? '',
-            });
-          }
-
-          reportData.add({
-            'teamName': team['name']?.toString() ?? 'Sin Nombre',
-            'players': playersForReport,
-          });
-        }
-      }
-
-      if (!mounted) return;
-      Navigator.pop(context); // Cerrar loading
-
-      await PdfService.generatePlayerReport(
-        title: 'REVISIÓN DE IDENTIDAD',
-        subTitle: 'Academia: ${academy['name']}',
-        reportData: reportData,
-      );
-    } catch (e) {
-      if (mounted) Navigator.pop(context);
-      _showErrorSnackBar("Error al exportar PDF: $e");
-    }
-  }
-
-  Future<void> _exportTeamPdf(Map<String, dynamic> team) async {
-    _showLoadingDialog("Generando reporte de equipo...");
-    try {
-      final teamId = (team['id'] ?? team['_id']).toString();
-      final resp = await _apiService.getPlayersByTeam(teamId);
-      if (resp.statusCode == 200) {
-        final dynamic rawData = resp.data;
-        final Map<String, dynamic> body = rawData is String 
-            ? Map<String, dynamic>.from(jsonDecode(rawData)) 
-            : Map<String, dynamic>.from(rawData is Map ? rawData : {});
-
-        final dynamic rowsRaw = body['rows'];
-        final List rowsList = rowsRaw is Iterable ? List.from(rowsRaw) : [];
-        
-        final List playersForReport = [];
-        for (var pJson in rowsList) {
-          final Map<String, dynamic> doc = Map<String, dynamic>.from(pJson is Map ? (pJson['doc'] ?? pJson) : {});
-          final p = Player.fromJson(doc);
-          final v = p.identidadValidada;
-          
-          String statusText = 'PDTE';
-          String missing = '';
-          if (v != null) {
-            if (v.status == 3) statusText = 'APROBADO';
-            else if (v.status == 2) {
-              statusText = 'PARCIAL';
-              List<String> m = [];
-              if (!v.foto) m.add('FOTO');
-              if (!v.identificacion) m.add('ID');
-              missing = m.join(', ');
-            } else {
-              statusText = 'RECHAZADO';
-              missing = 'TODOS';
-            }
-          }
-
-          playersForReport.add({
-            'name': p.fullName,
-            'number': p.number ?? '-',
-            'statusText': statusText,
-            'missing': missing,
-            'notes': v?.notas ?? '',
-          });
-        }
-
-        if (!mounted) return;
-        Navigator.pop(context);
-
-        final List finalReportData = [];
-        finalReportData.add({
-          'teamName': team['name']?.toString() ?? 'Sin Nombre',
-          'players': playersForReport,
-        });
-
-        await PdfService.generatePlayerReport(
-          title: 'REVISIÓN DE IDENTIDAD',
-          subTitle: 'Equipo: ${team['name']}',
-          reportData: finalReportData,
-        );
-      } else {
-        throw "Error al obtener jugadores: ${resp.statusCode}";
-      }
-    } catch (e, stack) {
-      dev.log("PDF Error: $e", stackTrace: stack);
-      if (mounted) Navigator.pop(context);
-      _showErrorSnackBar("Error al exportar PDF: $e");
-    }
   }
 }

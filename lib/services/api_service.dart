@@ -661,6 +661,55 @@ class ApiService {
     return await _dio.post('/editMultipleNlff', data: data);
   }
 
+  /// Actualiza solo `mood` y metadatos de pago en el servidor (documento equipo intacto).
+  Future<Response> assignTeamPayment({
+    required String teamId,
+    required int mood,
+    required String actingUserId,
+    String? assignedByUserName,
+    double? amount,
+    String? currency,
+    String? notes,
+  }) async {
+    return await _dio.post(
+      '/assignTeamPayment',
+      data: {
+        'token': _token,
+        'teamId': teamId,
+        'mood': mood,
+        'actingUserId': actingUserId,
+        if (assignedByUserName != null && assignedByUserName.isNotEmpty)
+          'assignedByUserName': assignedByUserName,
+        if (amount != null) 'amount': amount,
+        if (currency != null) 'currency': currency,
+        if (notes != null && notes.isNotEmpty) 'notes': notes,
+      },
+    );
+  }
+
+  /// Varios equipos; el servidor hace get/merge por cada uno (no reemplaza el doc completo).
+  Future<Response> assignTeamPaymentsBulk({
+    required List<Map<String, dynamic>> updates,
+    required String actingUserId,
+    String? assignedByUserName,
+    double? amount,
+    String? tournamentIdForSocket,
+  }) async {
+    return await _dio.post(
+      '/assignTeamPaymentsBulk',
+      data: {
+        'token': _token,
+        'updates': updates,
+        'actingUserId': actingUserId,
+        if (assignedByUserName != null && assignedByUserName.isNotEmpty)
+          'assignedByUserName': assignedByUserName,
+        if (amount != null) 'amount': amount,
+        if (tournamentIdForSocket != null)
+          'tournamentIdForSocket': tournamentIdForSocket,
+      },
+    );
+  }
+
   Future<Response> delImage(Map<String, dynamic> item) async {
     final data = {'token': _token, 'item': item};
     return await _dio.post('/deleteImageNlff', data: data);

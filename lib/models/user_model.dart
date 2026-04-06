@@ -18,9 +18,15 @@ class UserModel {
   });
 
   bool get isMaster => rol.toLowerCase() == 'master';
+  bool get isAdmin => rol.toLowerCase() == 'admin';
+  bool get isOperate => rol.toLowerCase() == 'operate';
   bool get isLogistic => rol.toLowerCase() == 'logistic';
-  bool get canManageSchedules =>
-      rol.toLowerCase() == 'master' || rol.toLowerCase() == 'logistic';
+
+  /// Master o logística pueden gestionar calendarios.
+  bool get canManageSchedules => isMaster || isLogistic;
+
+  /// Solo master y admin pueden asignar pagos.
+  bool get canAssignPayments => isMaster || isAdmin;
 
   // Factory para crear el usuario desde el JSON del API
   factory UserModel.fromJson(Map<String, dynamic> json) {
